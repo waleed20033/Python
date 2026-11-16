@@ -1,0 +1,204 @@
+# === FULL MERGED SCRIPT (ALL MODELS FULLY TRAINABLE, 15 EPOCHS, WITH CLASS WEIGHTS & COSINE LR) ===
+
+import os
+import zipfile
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet121, ResNet50, EfficientNetB0
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
+from tensorflow.keras.losses import CategoricalCrossentropy
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import accuracy_score, classification_report
+import math
+
+# === Paths ===
+DATA_DIR = os.getcwd()
+ORIG_ZIP = os.path.join(DATA_DIR, 'original_dataset.zip')
+ORIG_ROOT = os.path.join(DATA_DIR, 'original_dataset')
+TARGET_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS = 15
+
+# === Extract dataset if needed ===
+def extract_if_needed(zip_path, extract_to):
+    if os.path.isfile(zip_path) and not os.path.isdir(extract_to):
+        print(f"Extracting {zip_path} -> {extract_to}")
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            z.extractall(extract_to)
+    else:
+        print("Dataset already extracted or zip not present.")
+
+extract_if_needed(ORIG_ZIP, ORIG_ROOT)
+
+# === Find train/val/test splits ===
+def find_splits(root):
+    subs = [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    if len(subs) == 1:
+        inner = subs[0]
+        subs = [os.path.join(inner, d) for d in os.listdir(inner) if os.path.isdir(os.path.join(inner, d))]
+    train = next((d for d in subs if 'train' in os.path.basename(d).lower()), None)
+    val = next((d for d in subs if 'val' in os.path.basename(d).lower()), None)
+    test = next((d for d in subs if 'test' in os.path.basename(d).lower()), None)
+    if not (train and val and test):
+        raise FileNotFoundError("Could not locate train/val/test directories.")
+    print(f"Found splits -> train: {train}, val: {val}, test: {test}")
+    return train, val, test
+
+TRAIN_DIR, VAL_DIR, TEST_DIR = find_splits(ORIG_ROOT)
+
+# === Data Generators ===
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=30,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True
+)
+val_test_datagen = ImageDataGenerator(rescale=1./255)
+
+train_gen = train_datagen.flow_from_directory(
+    TRAIN_DIR, target_size=TARGET_SIZE, batch_size=BATCH_SIZE,
+    class_mode='categorical', shuffle=True
+)
+val_gen = val_test_datagen.flow_from_directory(
+    VAL_DIR, target_size=TARGET_SIZE, batch_size=BATCH_SIZE,
+    class_mode='categorical', shuffle=False
+)
+test_gen = val_test_datagen.flow_from_directory(
+    TEST_DIR, target_size=TARGET_SIZE, batch_size=BATCH_SIZE,
+    class_mode='categorical', shuffle=False
+)
+
+NUM_CLASSES = len(train_gen.class_indices)
+class_labels = list(train_gen.class_indices.keys())
+
+# === Compute class weights for imbalance handling ===
+cls_counts = np.bincount(train_gen.classes)
+y_arr = np.concatenate([np.full(n, i) for i, n in enumerate(cls_counts)])
+class_weights = compute_class_weight('balanced', classes=np.arange(NUM_CLASSES), y=y_arr)
+class_weights = {i: float(w) for i, w in enumerate(class_weights)}
+print("Class weights:", class_weights)
+
+# === Cosine decay LR scheduler ===
+def cosine_lr_schedule(initial_lr, steps_per_epoch, total_epochs):
+    def scheduler(epoch):
+        decay_steps = steps_per_epoch * total_epochs
+        lr = 0.5 * initial_lr * (1 + math.cos(math.pi * epoch / total_epochs))
+        return lr
+    return scheduler
+
+steps_per_epoch = max(1, int(np.ceil(train_gen.samples / BATCH_SIZE)))
+
+# === Common callbacks ===
+def get_callbacks(name):
+    return [
+        EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2),
+        ModelCheckpoint(f"{name}_best.h5", monitor='val_accuracy', save_best_only=True),
+        LearningRateScheduler(cosine_lr_schedule(1e-4, steps_per_epoch, EPOCHS))
+    ]
+
+# =========================
+# === DENSENET121 ===
+# =========================
+densenet_base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
+densenet_base.trainable = True
+
+densenet_model = models.Sequential([
+    densenet_base,
+    layers.GlobalAveragePooling2D(),
+    layers.Dense(256, activation='relu'),
+    layers.Dropout(0.5),
+    layers.Dense(NUM_CLASSES, activation='softmax')
+])
+densenet_model.compile(
+    optimizer=Adam(1e-4),
+    loss=CategoricalCrossentropy(label_smoothing=0.02),
+    metrics=['accuracy']
+)
+
+print("\n✅ Training DenseNet121...")
+history_dense = densenet_model.fit(
+    train_gen, validation_data=val_gen,
+    epochs=EPOCHS,
+    class_weight=class_weights,
+    callbacks=get_callbacks('densenet'),
+    verbose=1
+)
+
+y_pred_dense = np.argmax(densenet_model.predict(test_gen), axis=1)
+print(f"DenseNet121 Test Accuracy: {accuracy_score(test_gen.classes, y_pred_dense):.4f}")
+print(classification_report(test_gen.classes, y_pred_dense, target_names=class_labels, digits=4))
+
+# =========================
+# === RESNET50 ===
+# =========================
+resnet_base = ResNet50(weights='imagenet', include_top=False, input_shape=(224,224,3))
+resnet_base.trainable = True
+
+x = layers.GlobalAveragePooling2D()(resnet_base.output)
+x = layers.BatchNormalization()(x)
+x = layers.Dense(512, activation='relu')(x)
+x = layers.Dropout(0.4)(x)
+x = layers.Dense(256, activation='relu')(x)
+x = layers.Dropout(0.3)(x)
+output = layers.Dense(NUM_CLASSES, activation='softmax')(x)
+resnet_model = models.Model(resnet_base.input, output)
+resnet_model.compile(
+    optimizer=Adam(5e-5),
+    loss=CategoricalCrossentropy(label_smoothing=0.05),
+    metrics=['accuracy']
+)
+
+print("\n✅ Training ResNet50...")
+history_resnet = resnet_model.fit(
+    train_gen, validation_data=val_gen,
+    epochs=EPOCHS,
+    class_weight=class_weights,
+    callbacks=get_callbacks('resnet'),
+    verbose=1
+)
+
+y_pred_resnet = np.argmax(resnet_model.predict(test_gen), axis=1)
+print(f"ResNet50 Test Accuracy: {accuracy_score(test_gen.classes, y_pred_resnet):.4f}")
+print(classification_report(test_gen.classes, y_pred_resnet, target_names=class_labels, digits=4))
+
+# =========================
+# === EFFICIENTNETB0 ===
+# =========================
+inputs = layers.Input(shape=(224,224,3))
+x = layers.Rescaling(1./127.5, offset=-1.0)(inputs)
+
+eff_base = EfficientNetB0(include_top=False, weights='imagenet', input_tensor=x)
+eff_base.trainable = True
+
+x = layers.GlobalAveragePooling2D()(eff_base.output)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.3)(x)
+x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(1e-6))(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.3)(x)
+outputs = layers.Dense(NUM_CLASSES, activation='softmax', dtype='float32')(x)
+efficient_model = models.Model(inputs, outputs)
+efficient_model.compile(
+    optimizer=Adam(1e-4),
+    loss=CategoricalCrossentropy(label_smoothing=0.02),
+    metrics=['accuracy']
+)
+
+print("\n✅ Training EfficientNetB0...")
+history_eff = efficient_model.fit(
+    train_gen, validation_data=val_gen,
+    epochs=EPOCHS,
+    class_weight=class_weights,
+    callbacks=get_callbacks('efficientnet'),
+    verbose=1
+)
+
+y_pred_eff = np.argmax(efficient_model.predict(test_gen), axis=1)
+print(f"EfficientNetB0 Test Accuracy: {accuracy_score(test_gen.classes, y_pred_eff):.4f}")
+print(classification_report(test_gen.classes, y_pred_eff, target_names=class_labels, digits=4))
